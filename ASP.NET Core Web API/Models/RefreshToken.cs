@@ -7,5 +7,13 @@
         public DateTime Expires { get; set; }
         public bool IsRevoked { get; set; }
         public string UserId { get; set; } = null!;
+
+        // Metadata
+
+        public required string CreatedByIp { get; set; }
+        public required string UserAgent { get; set; }
+        public required string DeviceName { get; set; }
+        public string? DeviceId { get; set; }
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     }
 }

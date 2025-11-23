@@ -5,15 +5,10 @@ using Microsoft.EntityFrameworkCore;
 
 namespace ASP.NET_Core_Web_API.Data
 {
-    public class ApplicationDbContext :IdentityDbContext<IdentityUser>
+    public class ApplicationDbContext : IdentityDbContext<ApplicationUser>
     {
-       
-            public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options)
-                : base(options)
-            {
-            }
-
+        public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options) : base(options) { }
         public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
-
+        public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
     }
 }

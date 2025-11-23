@@ -1,5 +1,7 @@
 using ASP.NET_Core_Web_API.Data;
+using ASP.NET_Core_Web_API.Models;
 using ASP.NET_Core_Web_API.Services;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
@@ -17,7 +19,7 @@ builder.Services.AddDbContext<ApplicationDbContext>(options =>
 // ------------------------
 // Identity
 // ------------------------
-builder.Services.AddIdentity<IdentityUser, IdentityRole>(options =>
+builder.Services.AddIdentity<ApplicationUser, IdentityRole>(options =>
 {
     options.Password.RequireDigit = true;
     options.Password.RequireUppercase = false;
@@ -31,28 +33,41 @@ builder.Services.AddIdentity<IdentityUser, IdentityRole>(options =>
 // ------------------------
 // JWT CONFIG 
 // ------------------------
-var jwtSettings = builder.Configuration.GetSection("JwtSettings");
+var jwt = builder.Configuration.GetSection("JwtSettings");
+var keyValue = jwt["Key"] ?? throw new InvalidOperationException("JwtSettings:Key is missing");
+var key = Encoding.UTF8.GetBytes(keyValue);
 
-builder.Services.AddAuthentication("JwtBearer")
-    .AddJwtBearer("JwtBearer", options =>
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(options =>
+{
+    options.RequireHttpsMetadata = true;
+    options.SaveToken = true;
+    options.TokenValidationParameters = new TokenValidationParameters
     {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidateAudience = true,
-            ValidateIssuerSigningKey = true,
-            ValidIssuer = jwtSettings["Issuer"],
-            ValidAudience = jwtSettings["Audience"],
-            IssuerSigningKey = new SymmetricSecurityKey(
-                Encoding.UTF8.GetBytes(jwtSettings["Key"]!)
-            )
-        };
-    });
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(key),
+
+        ValidateIssuer = true,
+        ValidIssuer = jwt.GetValue<string>("Issuer"),
+
+        ValidateAudience = true,
+        ValidAudience = jwt.GetValue<string>("Audience"),
+
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.FromSeconds(30)
+    };
+
+    options.Events = new JwtBearerEvents();
+});
 
 // ------------------------
 // Servicios propios
 // ------------------------
-builder.Services.AddScoped<TokenSvc>();
+builder.Services.AddScoped<ITokenSvc, TokenSvc>();
 
 // ------------------------
 // Controllers + Swagger

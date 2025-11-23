@@ -2,7 +2,11 @@
 {
     public class LoginDto
     {
-        public string Email { get; set; } = null!;
-        public string Password { get; set; } = null!;
+        public string Email { get; set; } = string.Empty;
+        public string Password { get; set; } = string.Empty;
+
+        // Opcionales: para vincular el refresh token al dispositivo
+        public string? DeviceName { get; set; }
+        public string? DeviceId { get; set; }
     }
 }
