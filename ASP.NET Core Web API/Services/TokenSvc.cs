@@ -1,5 +1,7 @@
 ﻿using ASP.NET_Core_Web_API.Data;
 using ASP.NET_Core_Web_API.Models;
+using ASP.NET_Core_Web_API.Services;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
@@ -8,20 +10,20 @@ using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace ASP.NET_Core_Web_API.Services;
-
 public class TokenSvc : ITokenSvc
 {
     private readonly IConfiguration _config;
-    private readonly ApplicationDbContext _context;   
+    private readonly ApplicationDbContext _context;
+
+    // nombre cookie configurable
+    private const string RefreshCookieName = "refreshToken";
 
     public TokenSvc(IConfiguration config, ApplicationDbContext context)
     {
         _config = config;
-        _context = context;       
+        _context = context;
     }
 
-    // Helper: calculo SHA256 base64 (usado para persistir token hashed en DB)
     private static string HashToken(string token)
     {
         var bytes = Encoding.UTF8.GetBytes(token);
@@ -32,7 +34,8 @@ public class TokenSvc : ITokenSvc
     public string CreateAccessToken(ApplicationUser user, IEnumerable<string> roles, IDictionary<string, string>? extraClaims = null)
     {
         var jwt = _config.GetSection("JwtSettings");
-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwt["Key"]!));
+        var keyValue = jwt["Key"] ?? throw new InvalidOperationException("JwtSettings:Key missing");
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(keyValue));
         var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
         var claims = new List<Claim>
@@ -43,13 +46,9 @@ public class TokenSvc : ITokenSvc
             new Claim("userSecret", user.UserJwtSecret ?? string.Empty)
         };
 
-        // Roles
         foreach (var r in roles) claims.Add(new Claim(ClaimTypes.Role, r));
-
         if (extraClaims != null)
-        {
             foreach (var kv in extraClaims) claims.Add(new Claim(kv.Key, kv.Value));
-        }
 
         var token = new JwtSecurityToken(
             issuer: jwt["Issuer"],
@@ -62,21 +61,19 @@ public class TokenSvc : ITokenSvc
         return new JwtSecurityTokenHandler().WriteToken(token);
     }
 
-    // Crea refresh token: guarda HASH en DB y DEVUELVE el raw token (para poner en cookie HttpOnly)
+    // Core: crea refresh token (hash en DB) y devuelve raw token
     public async Task<RefreshToken> CreateRefreshTokenAsync(ApplicationUser user, string ip, string userAgent, string deviceName, string? deviceId)
     {
         var jwt = _config.GetSection("JwtSettings");
         int refreshDays = int.Parse(jwt["RefreshTokenExpirationDays"]!);
 
-        // Raw token seguro
         var rawBytes = RandomNumberGenerator.GetBytes(64);
         var rawToken = Convert.ToBase64String(rawBytes);
-
         var hashed = HashToken(rawToken);
 
         var refresh = new RefreshToken
         {
-            Token = hashed, // persistimos el hash
+            Token = hashed,
             UserId = user.Id,
             Expires = DateTime.UtcNow.AddDays(refreshDays),
             IsRevoked = false,
@@ -87,7 +84,6 @@ public class TokenSvc : ITokenSvc
             CreatedAt = DateTime.UtcNow
         };
 
-        // Limitar sesiones: leer config o fallback
         int maxSessions = _config.GetValue<int?>("Auth:MaxSessionsPerUser") ?? 5;
 
         var active = await _context.RefreshTokens
@@ -97,12 +93,12 @@ public class TokenSvc : ITokenSvc
 
         if (active.Count >= maxSessions)
         {
-            // revocar las más antiguas hasta dejar espacio
             int toRevoke = (active.Count - maxSessions) + 1;
-            var oldest = active.Take(toRevoke).ToList();
-            foreach (var o in oldest)
+            foreach (var o in active.Take(toRevoke))
             {
                 o.IsRevoked = true;
+                o.RevokedAt = DateTime.UtcNow;
+                o.RevokedReason = "AUTO_REVOKE_OLDEST_SESSION";
                 _context.AuditLogs.Add(new AuditLog
                 {
                     UserId = o.UserId,
@@ -124,10 +120,9 @@ public class TokenSvc : ITokenSvc
 
         await _context.SaveChangesAsync();
 
-        // Devolver objeto con token en claro (cliente lo guarda en cookie HttpOnly). 
         return new RefreshToken
         {
-            Token = rawToken,             // <-- raw para el cliente
+            Token = rawToken, // raw for client
             Expires = refresh.Expires,
             CreatedAt = refresh.CreatedAt,
             DeviceName = deviceName,
@@ -138,7 +133,6 @@ public class TokenSvc : ITokenSvc
         };
     }
 
-    // Busca refresh token por raw token (cliente envía raw, nosotros hasheamos y comparamos)
     public async Task<RefreshToken?> GetRefreshTokenAsync(string rawToken)
     {
         var hashed = HashToken(rawToken);
@@ -148,11 +142,10 @@ public class TokenSvc : ITokenSvc
 
         if (stored == null) return null;
 
-        // Devolver una copia con Token = rawToken para que el caller tenga el raw si lo necesita
         return new RefreshToken
         {
             Id = stored.Id,
-            Token = rawToken, // raw
+            Token = rawToken,
             Expires = stored.Expires,
             IsRevoked = stored.IsRevoked,
             UserId = stored.UserId,
@@ -164,17 +157,16 @@ public class TokenSvc : ITokenSvc
         };
     }
 
-    // Revoca token a partir de rawToken
     public async Task<bool> RevokeRefreshTokenAsync(string rawToken)
     {
         var hashed = HashToken(rawToken);
-
         var stored = await _context.RefreshTokens.FirstOrDefaultAsync(r => r.Token == hashed);
         if (stored == null) return false;
-
         if (stored.IsRevoked) return true;
 
         stored.IsRevoked = true;
+        stored.RevokedAt = DateTime.UtcNow;
+        stored.RevokedReason = "REVOKED_BY_USER";
         _context.AuditLogs.Add(new AuditLog
         {
             UserId = stored.UserId,
@@ -187,24 +179,141 @@ public class TokenSvc : ITokenSvc
         return true;
     }
 
+    // Rotación: revoca el token recibido y crea uno nuevo para el mismo device
     public async Task<RefreshToken?> RotateRefreshTokenAsync(string rawToken)
     {
-        var stored = await GetRefreshTokenAsync(rawToken);
+        var stored = await _context.RefreshTokens
+            .FirstOrDefaultAsync(r => r.Token == HashToken(rawToken) && !r.IsRevoked && r.Expires > DateTime.UtcNow);
+
         if (stored == null) return null;
 
-        // Revocar token actual
-        await RevokeRefreshTokenAsync(rawToken);
+        // Mark revoked (rotate)
+        stored.IsRevoked = true;
+        stored.RevokedAt = DateTime.UtcNow;
+        stored.RevokedReason = "ROTATED";
+        // Create new refresh token for same user/device
+        var user = await _context.Users.OfType<ApplicationUser>().FirstOrDefaultAsync(u => u.Id == stored.UserId);
+        if (user == null) return null;
 
-        // Crear token nuevo para el mismo dispositivo
-        var user = await _context.Users.FindAsync(stored.UserId);
+        // create new refresh token
+        var newRefresh = await CreateRefreshTokenAsync(user, stored.CreatedByIp, stored.UserAgent, stored.DeviceName, stored.DeviceId);
 
-        return await CreateRefreshTokenAsync(
-            user!,
-            stored.CreatedByIp,
-            stored.UserAgent,
-            stored.DeviceName,
-            stored.DeviceId
-        );
+        // link replaced tokens (store hashed value)
+        stored.ReplacedByToken = HashToken(newRefresh.Token);
+        await _context.SaveChangesAsync();
+
+        return newRefresh;
     }
 
+    // -----------------------------
+    // NUEVO: Genera access + refresh y pone cookie HttpOnly
+    // -----------------------------
+    public async Task<TokenPair> GenerateTokensAsync(ApplicationUser user, IEnumerable<string> roles, HttpResponse response, string ip, string userAgent, string deviceName, string? deviceId)
+    {
+        // access
+        var access = CreateAccessToken(user, roles);
+
+        // refresh (raw token)
+        var refresh = await CreateRefreshTokenAsync(user, ip, userAgent, deviceName, deviceId);
+
+        // set cookie
+        SetRefreshTokenCookie(response, refresh.Token, refresh.Expires);
+
+        return new TokenPair
+        {
+            AccessToken = access,
+            RefreshToken = refresh.Token
+        };
+    }
+
+    // helper to set cookie
+    public void SetRefreshTokenCookie(HttpResponse response, string rawToken, DateTime expires)
+    {
+        var cookieOptions = new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.Strict,
+            Expires = expires,
+            Path = "/"
+        };
+        response.Cookies.Append(RefreshCookieName, rawToken, cookieOptions);
+    }
+
+    // get active sessions for user
+    public async Task<IEnumerable<RefreshTokenInfo>> GetActiveSessionsAsync(string userId)
+    {
+        var tokens = await _context.RefreshTokens
+            .Where(r => r.UserId == userId && !r.IsRevoked && r.Expires > DateTime.UtcNow)
+            .OrderByDescending(r => r.CreatedAt)
+            .ToListAsync();
+
+        return tokens.Select(t => new RefreshTokenInfo
+        {
+            Id = t.Id,
+            DeviceName = t.DeviceName,
+            DeviceId = t.DeviceId,
+            CreatedAt = t.CreatedAt,
+            Expires = t.Expires,
+            UserAgent = t.UserAgent,
+            CreatedByIp = t.CreatedByIp
+        });
+    }
+
+    // revoke all sessions for a user
+    public async Task RevokeAllRefreshTokensAsync(string userId)
+    {
+        var tokens = await _context.RefreshTokens
+            .Where(r => r.UserId == userId && !r.IsRevoked)
+            .ToListAsync();
+
+        foreach (var t in tokens)
+        {
+            t.IsRevoked = true;
+            t.RevokedAt = DateTime.UtcNow;
+            t.RevokedReason = "REVOKE_ALL";
+        }
+
+        _context.AuditLogs.Add(new AuditLog
+        {
+            UserId = userId,
+            Action = "REVOKE_ALL_SESSIONS",
+            Ip = "system",
+            Details = "Revoked all sessions for user"
+        });
+
+        await _context.SaveChangesAsync();
+    }
+
+    //revocar por usuario
+    public async Task<bool> RevokeRefreshTokenByIdAsync(int id)
+    {
+        var token = await _context.RefreshTokens.FirstOrDefaultAsync(r => r.Id == id);
+        if (token == null) return false;
+
+        token.IsRevoked = true;
+        token.RevokedAt = DateTime.UtcNow;
+        token.RevokedReason = "REVOKED_MANUALLY";
+
+        await _context.SaveChangesAsync();
+        return true;
+    }
+}
+
+// helper TokenSvc
+public class TokenPair
+{
+    public string AccessToken { get; set; } = string.Empty;
+    public string RefreshToken { get; set; } = string.Empty;
+}
+
+public class RefreshTokenInfo
+{
+    public int Id { get; set; }
+    public string DeviceName { get; set; } = string.Empty;
+    public string? DeviceId { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime Expires { get; set; }
+    public string UserAgent { get; set; } = string.Empty;
+    public string CreatedByIp { get; set; } = string.Empty;
 }
